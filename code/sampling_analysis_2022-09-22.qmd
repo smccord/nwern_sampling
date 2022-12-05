@@ -1,0 +1,363 @@
+---
+title: "NWERN Sampling Analysis"
+format: 
+  html:
+    self-contained: true
+    df-print: paged
+    code-fold: true
+editor: visual
+execute: 
+  echo: false
+  warning: false
+---
+
+```{r setup, include=FALSE }
+
+library(terradactyl)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(forcats)
+
+# load functions
+source("functions.R")
+# read in data
+indicators <- readRDS("data/NWERN_geoIndicators_2022-09-09.rdata")
+
+# subset data to relevant indicators
+indicators <- indicators %>% dplyr::select(PrimaryKey, ProjectKey, DateVisited, BareSoilCover:GapCover_25_plus) %>% 
+  #subset to only transect visits
+  subset(!is.na(BareSoilCover))
+
+# change DateVisited to Date field
+indicators$DateVisited <- as.Date(indicators$DateVisited)
+# create tall table
+ind_tall <- tidyr::pivot_longer(indicators, names_to = "indicator", 
+                                values_to = "percent", 
+                                cols = BareSoilCover:GapCover_25_plus) %>%
+  subset(!is.na(percent))
+```
+
+## National Wind Erosion Research Network
+
+Add blurb here...including
+
+1.  Background
+2.  Sampling
+    1.  Layout
+
+    2.  Timeline
+3.  Pictures of each site
+
+## NWERN Site Summaries
+
+The NWERN was established in 2015, with `r length(unique(indicators$ProjectKey))` sites reporting data. NWERN sites represent a range agroecosystems.
+
+::: panel-tabset
+## Plot
+
+```{r}
+#| df-print: paged
+library(terradactyl)
+library(tidyverse)
+source("functions.R")
+
+site_plots <- ggplot(ind_tall %>% subset(indicator %in% c("BareSoilCover", "TotalFoliarCover", "GapCover_200_plus")), aes(x = DateVisited, y = percent, color = indicator)) +
+  facet_wrap(. ~ ProjectKey) + 
+  geom_line()
+site_plots
+
+```
+
+## Visit Summary
+
+```{r}
+# add visit stats
+visit_stats <- indicators %>% dplyr::group_by(ProjectKey) %>% 
+  dplyr::summarise(n = length(unique(PrimaryKey)), 
+                   FirstVisit = min(DateVisited, na.rm = TRUE), 
+                   LastVisit = max(DateVisited, na.rm = TRUE)) 
+visit_stats
+
+```
+
+## Indicator Table
+
+```{r}
+
+# summarize data by ProjectKey
+indicator_summary <- ind_tall %>%
+  dplyr::group_by(ProjectKey, PrimaryKey, indicator) %>% 
+  dplyr::summarise(mean = mean(percent), 
+                   sd = sd(percent, na.rm = F),
+                     max = max(percent),
+                   min = min(percent))
+
+
+indicator_summary
+```
+:::
+
+# NWERN Method Implementation
+
+At each NWERN site, vegetation sampling is conducted at three 100 m transects, which intersect at the center of the site, where a meteorological tower is present (Figure 1). The transects follow the bearings of 0, 60, and 120 degrees respectively. Observations at the center of the site that intersect with the meteorological tower base are removed from analysis.
+
+![Figure 1. Vegetation sampling transect layout. Note: this illustration is not drawn to scale.](images/paste-55FDE8E9.png)
+
+# Line-point Intercept
+
+Currently, LPI pin drops are observed every 25 cm along the vegetation transects. Observations that intersect the meteorological tower pad are removed.
+
+```{r load LPI data}
+# load LPI tall data
+lpi_tall <- readRDS("data/NWERN_tall_lpi_2022-09-08.rdata")
+
+```
+
+### How many LPI pin drops are needed to get the same answer (within 5%)?
+
+```{r LPI iterations}
+
+args <- list(
+  line_length = c(25,50, 100),
+  interval = c(25,50, 100, 200),
+  n_lines = c(1,2,3), 
+  FUN = c(pct_cover_bare_soil, pct_cover_total_foliar)
+)
+
+iteration_calcs <- args %>%
+  purrr::cross_df()  %>% purrr::pmap_df(lpi_iteration, lpi_tall = lpi_tall)
+
+# reserve the actual NWERN implementation
+nwern_calcs <- iteration_calcs %>% subset(line_length == 100 &
+                                          interval == 25 &
+                                          n_lines == 3) %>% 
+  select(PrimaryKey, indicator, nwern_percent=percent)
+
+#join back to iterations
+iteration_calcs <- dplyr::left_join(nwern_calcs, iteration_calcs) %>%
+  # get difference
+  dplyr::mutate(difference = nwern_percent-percent)
+
+# add group variable
+iteration_calcs <- iteration_calcs %>% dplyr::mutate(
+  group = paste("I", interval, "L", line_length, "N", n_lines, sep = "_")
+)
+
+iteration_calcs$group[iteration_calcs$group=="I_25_L_100_N_3"]<-"NWERN Base"
+
+write.csv(iteration_calcs, paste0("results/lpi_teration", Sys.Date(), ".csv"))
+```
+
+Summarize and plot results
+
+```{r summarize results}
+iteration_calcs <- latest_file(fpattern="lpi_teration.*csv", 
+                               fpath="results") %>% read.csv()
+
+iteration_summary <- iteration_calcs %>% dplyr::group_by(indicator, interval, n_lines, line_length) %>% 
+  dplyr::summarise(diff_mean = mean(difference),
+                   diff_sd = sd(difference),
+                   min = min(difference),
+                   max = max(difference)
+) %>% dplyr::mutate(n_lines = as.factor(n_lines),
+                    line_length = as.factor(line_length),
+                    interval = as.factor(interval))
+
+#add factor levels to iteration scenarios
+iteration_calcs <- iteration_calcs %>% 
+  dplyr::mutate(n_lines = as.factor(n_lines) %>% fct_rev(),
+                line_length = as.factor(line_length) %>% fct_rev(),
+                    interval = as.factor(interval))
+
+```
+
+::: panel-tabset
+## Total Foliar Cover
+
+```{r}
+# plot differences
+diff <- ggplot(iteration_calcs %>% subset(indicator == "TotalFoliarCover"),
+                        aes(x = interval,
+                            y = difference, 
+                            group = interval)) +
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_boxplot()+
+  geom_hline(yintercept = -5, linetype="dashed", color = "red")+
+  geom_hline(yintercept = 5, linetype="dashed", color = "red")
+diff
+```
+
+## LM
+
+```{r}
+# plot differences
+diff <- ggplot(iteration_calcs %>% subset(indicator == "LM"),
+                        aes(x = interval,
+                            y = difference, 
+                            group = interval)) +
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_boxplot()+
+  geom_hline(yintercept = -5, linetype="dashed", color = "red")+
+  geom_hline(yintercept = 5, linetype="dashed", color = "red")
+diff
+```
+
+## PC
+
+```{r}
+# plot differences
+diff <- ggplot(iteration_calcs %>% subset(indicator == "PC"),
+                        aes(x = interval,
+                            y = difference, 
+                            group = interval)) +
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_boxplot()+
+  geom_hline(yintercept = -5, linetype="dashed", color = "red")+
+  geom_hline(yintercept = 5, linetype="dashed", color = "red")
+diff
+```
+
+## FG
+
+```{r}
+# plot differences
+diff <- ggplot(iteration_calcs %>% subset(indicator == "FG"),
+                        aes(x = interval,
+                            y = difference, 
+                            group = interval)) +
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_boxplot()+
+  geom_hline(yintercept = -5, linetype="dashed", color = "red")+
+  geom_hline(yintercept = 5, linetype="dashed", color = "red")
+diff
+```
+:::
+
+### Is there a relationship between cover and detectable difference?
+
+::: panel-tabset
+## 25
+
+```{r}
+ggplot(iteration_calcs %>% subset(indicator == "TotalFoliarCover" & interval == 25), aes(x = nwern_percent,y = difference,fill = interval))+
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_point()+
+  geom_smooth()
+```
+
+## 50
+
+```{r}
+ggplot(iteration_calcs %>% subset(indicator == "TotalFoliarCover" & interval == 50), aes(x = nwern_percent,y = difference,fill = interval))+
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_point()+
+  geom_smooth()
+```
+
+## 100
+
+```{r}
+ggplot(iteration_calcs %>% subset(indicator == "TotalFoliarCover" & interval == 100), aes(x = nwern_percent,y = difference,fill = interval))+
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_point()+
+  geom_smooth()
+```
+
+## 200
+
+```{r}
+ggplot(iteration_calcs %>% subset(indicator == "TotalFoliarCover" & interval == 25), aes(x = nwern_percent,y = difference,fill = interval))+
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_point()+
+  geom_smooth()
+```
+:::
+
+### Are the different iterations significantly different?
+
+```{r test significance}
+
+# a proportions test is more appropriate for LPI as it is a binary response variable and thus follows the binomial distribution
+ptest <- iteration_calcs %>% subset(nwern_percent > 0) %>%
+  mutate(percent_n = round(percent*pin_n/100),
+         nwern_percent_n = round(nwern_percent*pin_n/100)) %>%
+  group_by(PrimaryKey, group, indicator) %>%
+  summarise(ptest_p = prop.test(x= c(percent_n, nwern_percent_n), 
+                                n = c(pin_n, pin_n))$p.value) %>% 
+  mutate(significant = case_when(ptest_p<=0.05 ~ "yes",
+                                 TRUE ~ "no"))
+
+ptest_summary <- ptest %>% 
+  dplyr::group_by(group, indicator) %>% add_tally(name = "total_n") 
+
+ptest_summary2 <- ptest_summary %>%  group_by(group, indicator, significant) %>% summarise(prop_significant = n()/total_n) %>% distinct()
+
+# add group, interval, n_line, line_length to table
+ptest_summary2 <- dplyr::left_join(ptest_summary2, 
+                                    iteration_calcs %>% dplyr::select(group,
+                                                                      line_length, 
+                                                                      n_lines, 
+                                                                      interval) %>% 
+                                     distinct())%>% 
+  dplyr::mutate(n_lines = as.factor(n_lines) %>% fct_rev(),
+                line_length = as.factor(line_length) %>% fct_rev(),
+                    interval = as.factor(interval))
+
+# plot significance
+prop_test_sig <- ggplot(ptest_summary2 %>% subset(prop_significant =="yes"), 
+                        aes(x = interval,
+                            y = prop_significant, 
+                            color = n_lines)) +
+   geom_bar()
+
+# # do a ttest to see if different to full NWERN implementation, remove instances where the NWERN default sampling set up recorded 0??
+# lpi_ttest <- iteration_ttest(iteration_calcs)
+# 
+# # summarize t-test results
+# summary_ttest <- lpi_ttest %>% select(group, indicator, significant) %>%
+#   tidyr::pivot_wider(names_from = indicator,
+#                      values_from = significant)
+# 
+# # look at significance by site
+# iteration_calcs <- iteration_calcs %>% dplyr::left_join(indicators %>% dplyr::select(PrimaryKey, ProjectKey))
+# 
+# ProjectKey_summary <- iteration_calcs %>% dplyr::group_by(ProjectKey, group)%>% add_tally() %>% subset(n>3)
+# 
+# site_ttest <- lapply(X = unique(ProjectKey_summary$ProjectKey),
+#                      function(X){
+#                        data = ProjectKey_summary %>% subset(ProjectKey==X)
+#                          iteration_ttest(data) %>% dplyr::mutate(site = X)
+#                      })%>% do.call("rbind",.)
+# 
+# # summarize t-test results
+# site_summary_ttest <- site_ttest %>% select(site, group, indicator, significant) %>%
+#   tidyr::pivot_wider(names_from = indicator,
+#                      values_from = significant)
+```
+
+1.  How many LPI pin drops are needed to detect 5, 10, 15% change in cover?
+
+2.  Species accumulation curves
+
+# Questions
+
+Look at within site comparison--over time and to full NWERN implementation.
+
+1.  
+
+2.  How many height measurements are needed to detect a 10% change in height?
+
+3.  What is the influence of transect length vs \# of pin drops?
+
+4.  What is the influence of transect length on gap intercept estimates?
+
+5.  Is there a difference in estimates for 3 dispersed transects vs one single transect?

@@ -1,0 +1,190 @@
+---
+title: "NWERN Sampling Analysis"
+format: 
+  html:
+    self-contained: true
+    df-print: paged
+    code-fold: true
+editor: visual
+execute: 
+  echo: false
+  warning: false
+---
+
+```{r setup, include=FALSE }
+
+library(terradactyl)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+# read in data
+indicators <- readRDS("data/NWERN_geoIndicators_2022-09-09.rdata")
+
+# subset data to relevant indicators
+indicators <- indicators %>% dplyr::select(PrimaryKey, ProjectKey, DateVisited, BareSoilCover:GapCover_25_plus) %>% 
+  #subset to only transect visits
+  subset(!is.na(BareSoilCover))
+
+# change DateVisited to Date field
+indicators$DateVisited <- as.Date(indicators$DateVisited)
+# create tall table
+ind_tall <- tidyr::pivot_longer(indicators, names_to = "indicator", 
+                                values_to = "percent", 
+                                cols = BareSoilCover:GapCover_25_plus) %>%
+  subset(!is.na(percent))
+```
+
+## National Wind Erosion Research Network
+
+Add blurb here...including
+
+1.  Background
+2.  Sampling
+    1.  Layout
+
+    2.  Timeline
+3.  Pictures of each site
+
+## NWERN Site Summaries
+
+The NWERN was established in 2015, with `r length(unique(indicators$ProjectKey))` sites reporting data. NWERN sites represent a range agroecosystems.
+
+::: panel-tabset
+## Plot
+
+```{r}
+#| df-print: paged
+
+library(ggplot2)
+
+site_plots <- ggplot(ind_tall %>% subset(indicator %in% c("BareSoilCover", "TotalFoliarCover", "GapCover_200_plus")), aes(x = DateVisited, y = percent, color = indicator)) +
+  facet_wrap(. ~ ProjectKey) + 
+  geom_line()
+site_plots
+
+```
+
+## Visit Summary
+
+```{r}
+# add visit stats
+visit_stats <- indicators %>% dplyr::group_by(ProjectKey) %>% 
+  dplyr::summarise(n = length(unique(PrimaryKey)), 
+                   FirstVisit = min(DateVisited, na.rm = TRUE), 
+                   LastVisit = max(DateVisited, na.rm = TRUE)) 
+visit_stats
+
+```
+
+## Indicator Table
+
+```{r}
+
+# summarize data by ProjectKey
+indicator_summary <- ind_tall %>%
+  dplyr::group_by(ProjectKey, PrimaryKey, indicator) %>% 
+  dplyr::summarise(mean = mean(percent), 
+                   sd = sd(percent, na.rm = F),
+                     max = max(percent),
+                   min = min(percent))
+
+
+indicator_summary
+```
+:::
+
+# NWERN Method Implementation
+
+At each NWERN site, vegetation sampling is conducted at three 100 m transects, which intersect at the center of the site, where a meteorological tower is present (Figure 1). The transects follow the bearings of 0, 60, and 120 degrees respectively. Observations at the center of the site that intersect with the meteorological tower base are removed from analysis.
+
+![Figure 1. Vegetation sampling transect layout. Note: this illustration is not drawn to scale.](images/paste-55FDE8E9.png)
+
+# Line-point Intercept
+
+Currently, LPI pin drops are observed every 25 cm along the vegetation transects. Observations that intersect the meteorological tower pad are removed.
+
+```{r load LPI data}
+# load LPI tall data
+lpi_tall <- readRDS("data/NWERN_tall_lpi_2022-09-08.rdata")
+
+# summarize pin drops/plot viist
+pin_drop_summary <- lpi_tall %>% dplyr::select(PrimaryKey, LineKey, PointNbr) %>%
+  dplyr::distinct() %>% 
+  dplyr::group_by(PrimaryKey) %>% 
+  dplyr::tally()
+
+lpi_tall <- lpi_tall %>% subset(PrimaryKey %in% pin_drop_summary$PrimaryKey[pin_drop_summary$n>1000])
+
+# join to indicator table to get ProjectKey
+dplyr::left_join(indicators %>%
+                   dplyr::select(ProjectKey,PrimaryKey),
+                 pin_drop_summary %>% subset(n>1000)) %>% 
+  subset(!is.na(n)) %>%
+  dplyr::group_by(ProjectKey) %>% 
+  dplyr::summarise(mean = mean(n), 
+                   min = min (n),
+                   max = max(n))
+```
+
+1.  How many LPI pin drops are needed to get the same answer (within 5%)?
+
+```{r}
+
+bare_soil_actual <- pct_cover_bare_soil(lpi_tall) %>% 
+  dplyr::mutate(Actual_BareSoilCover = FG + AG + PC + LM +S) %>% 
+  dplyr::select(PrimaryKey, Actual_BareSoilCover)
+
+# calculate bare soil for pin drops ranging from the max down to 0, this is the same as shortening the transect
+pin_n <- c(1:5)
+bare_soil<- lapply(X = pin_n, function(X){
+    print(X)
+  bare_soil <- pct_cover_bare_soil(lpi_tall %>% subset(PointNbr <= X)) %>% 
+    dplyr::mutate(interval = 25,                                                                     line_length = 100,
+                  pin_n = X)
+
+}) %>% do.call("rbind", .)
+
+#write.csv(bare_soil_iteration,"bare_soil_pin_n.csv" )
+
+# calculate bare soil for 100 m transect with intervals ranging from 50 cm to 2 m
+pin_n_100_m <- c(2, 4, 8, 12, 16, 20)
+bare_soil_interval_100 <- lapply(X = pin_n_100_m, function(X){
+    print(X)
+  pointnbr <- seq(1,400, X)
+  bare_soil <- pct_cover_bare_soil(lpi_tall %>% subset(PointNbr %in% pointnbr)) %>%     dplyr::mutate(interval = 25,                                                                     line_length = 100,
+                  pin_n = 3*400/X)
+
+}) %>% do.call("bind_rows", .) %>% 
+  dplyr::rowwise() %>% 
+  dplyr::mutate(BareSoilCover = sum(FG,AG, PC, LM,S,na.rm=TRUE)) %>% 
+  dplyr::select(-c(FG, AG, PC, LM, S))
+
+# compare to bare soil actual
+bare_soil_interval_100 <- bare_soil_interval_100 %>% 
+  dplyr::left_join(bare_soil_actual) %>% 
+  dplyr::mutate(Difference = Actual_BareSoilCover - BareSoilCover)
+
+# plot differences
+interval_diff <- ggplot(bare_soil_interval_100, aes(x = pin_n,
+                                                    y = Difference, 
+                                                    group = pin_n)) +
+  geom_boxplot()
+```
+
+1.  How many LPI pin drops are needed to detect 5, 10, 15% change in cover?
+
+2.  Species accumulation curves
+
+# Questions
+
+Look at within site comparison--over time and to full NWERN implementation.
+
+1.  
+
+2.  How many height measurements are needed to detect a 10% change in height?
+
+3.  What is the influence of transect length vs \# of pin drops?
+
+4.  What is the influence of transect length on gap intercept estimates?
+
+5.  Is there a difference in estimates for 3 dispersed transects vs one single transect?
