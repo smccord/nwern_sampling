@@ -1,0 +1,931 @@
+---
+title: "NWERN Sampling Analysis"
+format: 
+  html:
+    self-contained: true
+    df-print: paged
+    code-fold: true
+editor: visual
+execute: 
+  echo: false
+  warning: false
+---
+
+```{r setup, include=FALSE }
+
+library(terradactyl)
+library(dplyr)
+library(ggplot2)
+library(purrr)
+library(forcats)
+library(furrr)
+
+# load functions
+source("functions.R")
+# read in data
+indicators <- readRDS("data/NWERN_geoIndicators_2022-09-09.rdata")
+
+# subset data to relevant indicators
+indicators <- indicators %>% dplyr::select(PrimaryKey, ProjectKey, DateVisited, BareSoilCover:GapCover_25_plus) %>% 
+  #subset to only transect visits
+  subset(!is.na(BareSoilCover))
+
+# change DateVisited to Date field
+indicators$DateVisited <- as.Date(indicators$DateVisited)
+# create tall table
+ind_tall <- tidyr::pivot_longer(indicators, names_to = "indicator", 
+                                values_to = "percent", 
+                                cols = BareSoilCover:GapCover_25_plus) %>%
+  subset(!is.na(percent))
+```
+
+## National Wind Erosion Research Network
+
+Add blurb here...including
+
+1.  Background
+2.  Sampling
+    1.  Layout
+
+    2.  Timeline
+3.  Pictures of each site
+
+## NWERN Site Summaries
+
+The NWERN was established in 2015, with `r length(unique(indicators$ProjectKey))` sites reporting data. NWERN sites represent a range agroecosystems.
+
+::: panel-tabset
+## Plot
+
+```{r}
+site_plots <- ggplot(ind_tall %>% subset(indicator %in% c("BareSoilCover", "TotalFoliarCover", "GapCover_200_plus")), aes(x = DateVisited, y = percent, color = indicator)) +
+  facet_wrap(. ~ ProjectKey) + 
+  geom_line()
+site_plots
+
+```
+
+## Visit Summary
+
+```{r}
+# add visit stats
+visit_stats <- indicators %>% dplyr::group_by(ProjectKey) %>% 
+  dplyr::summarise(n = length(unique(PrimaryKey)), 
+                   FirstVisit = min(DateVisited, na.rm = TRUE), 
+                   LastVisit = max(DateVisited, na.rm = TRUE)) 
+visit_stats
+
+```
+
+## Indicator Table
+
+```{r}
+
+# summarize data by ProjectKey
+indicator_summary <- ind_tall %>%
+  dplyr::group_by(ProjectKey, indicator) %>% 
+  dplyr::summarise(mean = mean(percent), 
+                   sd = sd(percent, na.rm = F),
+                     max = max(percent),
+                   min = min(percent))
+
+
+indicator_summary
+```
+:::
+
+# NWERN Method Implementation
+
+At each NWERN site, vegetation sampling is conducted at three 100 m transects, which intersect at the center of the site, where a meteorological tower is present (Figure 1). The transects follow the bearings of 0, 60, and 120 degrees respectively. Observations at the center of the site that intersect with the meteorological tower base are removed from analysis.
+
+![Figure 1. Vegetation sampling transect layout. Note: this illustration is not drawn to scale.](images/paste-55FDE8E9.png)
+
+# Line-point Intercept
+
+Currently, LPI pin drops are observed every 25 cm along the vegetation transects. Observations that intersect the meteorological tower pad are removed.
+
+```{r load LPI data}
+# load LPI tall data
+lpi_tall <- readRDS("data/NWERN_tall_lpi_2022-09-08.rdata")
+
+# count number of pin drops in plots
+n_pin_measured <- lpi_tall %>% select(PrimaryKey, LineKey, PointNbr) %>% distinct() %>% 
+  group_by(PrimaryKey) %>% count()
+
+# remove plots with less than 1000 pin drops as they are not eligible to be part of the study
+lpi_tall <- lpi_tall %>% subset(PrimaryKey %in% n_pin_measured$PrimaryKey[n_pin_measured$n >1000])
+```
+
+### How many LPI pin drops are needed to get the same answer (within 5%)?
+
+```{r LPI iterations}
+
+args <- list(
+  line_length = c(25,50, 100),
+  interval = c(25,50, 100, 200),
+  n_lines = c(1,2,3), 
+  FUN = c(pct_cover_total_foliar)
+)
+
+iteration_calcs <- 
+  tidyr::expand_grid(line_length = c(25,50, 100),
+  interval = c(25,50, 100, 200),
+  n_lines = c(1,2,3), 
+  FUN = c(pct_cover_total_foliar))  %>% purrr::pmap_df(lpi_iteration, lpi_tall = lpi_tall)
+
+# reserve the actual NWERN implementation
+nwern_calcs <- iteration_calcs %>% subset(line_length == 100 &
+                                          interval == 25 &
+                                          n_lines == 3) %>% 
+  select(PrimaryKey, indicator, nwern_percent=percent, nwern_pin_n = pin_n)
+
+#join back to iterations
+iteration_calcs <- dplyr::left_join(nwern_calcs, iteration_calcs) %>%
+  # get difference
+  dplyr::mutate(difference = nwern_percent-percent)
+
+# add group variable
+iteration_calcs <- iteration_calcs %>% dplyr::mutate(
+  group = paste("I", interval, "L", line_length, "N", n_lines, sep = "_")
+)
+
+iteration_calcs$group[iteration_calcs$group=="I_25_L_100_N_3"]<-"NWERN Base"
+
+write.csv(iteration_calcs, paste0("results/lpi_iteration", Sys.Date(), ".csv"))
+```
+
+Summarize and plot results
+
+```{r summarize results}
+iteration_calcs <- latest_file(fpattern="lpi_iteration.*csv", 
+                               fpath="results") %>% read.csv()
+
+iteration_summary <- iteration_calcs %>% dplyr::group_by(indicator, interval, n_lines, line_length) %>% 
+  dplyr::summarise(diff_mean = mean(difference),
+                   diff_sd = sd(difference),
+                   min = min(difference),
+                   max = max(difference)
+) %>% dplyr::mutate(n_lines = as.factor(n_lines),
+                    line_length = as.factor(line_length),
+                    interval = as.factor(interval))
+
+#add factor levels to iteration scenarios
+iteration_calcs <- iteration_calcs %>% 
+  dplyr::mutate(n_lines = as.factor(n_lines) %>% fct_rev(),
+                line_length = as.factor(line_length) %>% fct_rev(),
+                    interval = as.factor(interval))
+
+```
+
+::: panel-tabset
+## Total Foliar Cover
+
+```{r}
+# plot differences
+diff <- ggplot(iteration_calcs %>% subset(indicator == "TotalFoliarCover"),
+                        aes(x = interval,
+                            y = difference, 
+                            group = interval)) +
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_boxplot()+
+  geom_hline(yintercept = -5, linetype="dashed", color = "red")+
+  geom_hline(yintercept = 5, linetype="dashed", color = "red")
+diff
+```
+
+## How many times does changing sample size yield a result of 2, 5, 10% difference?
+
+```{r}
+diff_summary <- iteration_calcs %>% 
+  mutate(difference_type = case_when(abs(difference) <2 ~ "< 2", 
+                                     abs(difference) <5 & abs(difference) >=2 ~ "< 5",
+                                     abs(difference) <10 & abs(difference) >=5~"< 10",
+                                     abs(difference) >=10 ~"> 10"),
+         difference_type = factor(difference_type, 
+                                  levels = c("< 2", "< 5","< 10", "> 10"))
+  ) %>% 
+  group_by(group) %>% add_count() %>% 
+  group_by(group, difference_type) %>% summarise(freq = n()/unique(n)) %>%
+  dplyr::left_join(iteration_calcs %>% dplyr::select(group,
+                                                     line_length, 
+                                                     n_lines, 
+                                                     interval, 
+                                                     pin_n) %>% distinct())
+
+ggplot(diff_summary,
+       aes(x=interval, 
+           y = freq,
+           fill = difference_type)) +
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_bar(stat = "identity")
+
+# plot 
+
+
+```
+:::
+
+### Are the different iterations significantly different from base NWERN?
+
+```{r test significance}
+
+# a proportions test is more appropriate for LPI as it is a binary response variable and thus follows the binomial distribution
+f_test <- pmap_df(distinct(iteration_calcs %>% select(PK_sample = PrimaryKey, 
+                                                     group_sample = group)) %>% 
+                   filter(group_sample!="NWERN Base") %>%
+                    mutate(compare_group = "NWERN Base", 
+                           compare_sample = ""),fisher_test) 
+
+write.csv(f_test, paste0("results/lpi_f_test", Sys.Date(), ".csv"))
+
+ftest_summary <- f_test %>% 
+  dplyr::group_by(group) %>% add_tally(name = "total_n") %>% 
+  dplyr::mutate(significant = dplyr::case_when(p.value <= 0.05 ~ "yes", 
+                                               p.value > 0.05 ~ "no"))
+
+
+ftest_summary2 <- ftest_summary %>%  group_by(group,  significant) %>% summarise(prop_significant = n()/total_n) %>% distinct()
+
+# add group, interval, n_line, line_length to table
+ftest_summary2 <- dplyr::left_join(ftest_summary2, 
+                                    iteration_calcs %>% dplyr::select(group,
+                                                                      line_length, 
+                                                                      n_lines, 
+                                                                      interval, 
+                                                                      pin_n) %>% 
+                                     distinct())%>% 
+  dplyr::mutate(n_lines = as.factor(n_lines),
+                line_length = as.factor(line_length),
+                    interval = as.factor(interval)
+                )
+
+# plot significance
+prop_test_sig <- ggplot(ftest_summary2, 
+                        aes(x = interval, 
+                            y = prop_significant,
+                            fill = significant)) +
+     facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_bar(position="stack", stat="identity")
+
+prop_test_sig
+
+
+```
+
+## Detect change over time?
+
+```{r}
+
+# add DateVisited
+iteration_calcs <- iteration_calcs %>% 
+  dplyr::left_join(indicators %>% dplyr::select(ProjectKey, 
+                                                PrimaryKey, 
+                                                DateVisited), 
+                   by = "PrimaryKey")
+
+# plot
+ggplot(iteration_calcs, aes(x = DateVisited, y = percent, color = group)) +
+  facet_wrap(. ~ ProjectKey) + 
+  geom_line() 
+
+# look at differences over time
+visit_combos <- iteration_calcs %>% 
+  mutate (project_group = paste0(ProjectKey, group)) %>% 
+            group_by(ProjectKey) %>% do(data.frame(t(combn(.$PrimaryKey, 2)))) %>% 
+  distinct() %>% rename(PK_sample = X1, 
+                        compare_pk = X2) %>% 
+  subset(PK_sample != compare_pk) %>% 
+  
+# add sample group iteration in
+  tidyr::expand(PK_sample, compare_pk, group_sample = unique(iteration_calcs$group)) %>% ungroup()
+
+# calculate significant differences between all plot visit combinations within a subsample group
+f_test_date <- pmap_df(visit_combos %>% select(PK_sample, 
+                                          compare_sample = compare_pk, 
+                                          group_sample) %>% mutate(compare_group = ""),fisher_test) 
+
+# extract the NWERN base visit tests
+nwern_f_test <- f_test_date %>% subset(group == "NWERN Base") %>%
+  mutate(nwern_significant = case_when(p.value <0.05 ~ "p < 0.05",
+                                       p.value >=0.05 & p.value <0.2 ~ "0.2 > p >= 0.5",
+                                       p.value >=0.2 ~ "not significant"), 
+         nwern_p.value = p.value)
+
+f_test_date <- dplyr::left_join(f_test_date, nwern_f_test %>% 
+                                  select(PrimaryKey, 
+                                         compare,                                                                      nwern_significant, 
+                                         nwern_p.value), 
+                                by = c("PrimaryKey",  "compare")) %>% 
+  mutate(significant = case_when(p.value <0.05 ~ "p < 0.05",
+                                 p.value >=0.05 & p.value <0.2 ~ "0.2 > p >= 0.5",
+                                 p.value >=0.2 ~ "not significant"))
+
+# set levels
+f_test_date <- f_test_date %>% 
+  dplyr::mutate(nwern_significant = nwern_significant %>% as_factor(), 
+                significant = significant %>% as_factor())
+
+f_test_date <- dplyr::left_join(f_test_date, iteration_calcs %>% dplyr::select(group,
+                                                                      line_length, 
+                                                                      n_lines, 
+                                                                      interval, 
+                                                                      pin_n) %>% 
+                                  distinct()) %>%
+  dplyr::left_join(iteration_calcs %>% select(ProjectKey, PrimaryKey) %>% distinct(),
+                   by = "PrimaryKey")
+
+write.csv(f_test_date, paste0("results/lpi_f_test_date", Sys.Date(), ".csv"))
+
+# change levels
+f_test_date <- f_test_date %>% 
+  dplyr::mutate(n_lines = as.factor(n_lines) %>% fct_rev(),
+                line_length = as.factor(line_length) %>% fct_rev(),
+                interval = as.factor(interval))
+
+# plot
+library(ggmosaic)
+
+
+ggplot(data = f_test_date) +
+   facet_grid(n_lines + line_length ~ interval)+
+  geom_mosaic(aes(x = product( significant, nwern_significant), fill=significant)) + 
+
+  scale_fill_manual(values = c("#721f81", "#9e2f7f", "#feca8d"))
+
+# isolate p < 0.05
+f_test_date1 <- f_test_date %>%
+  mutate(significant = case_when(p.value <0.05 ~ "p < 0.05",
+                                 p.value >=0.05 ~ "not significant")%>% as_factor(),
+         nwern_significant = case_when(nwern_p.value <0.05 ~ "p < 0.05",
+                                       nwern_p.value >=0.05 ~ "not significant")%>% as_factor())
+
+
+ggplot(data = f_test_date1) +
+   facet_grid(n_lines + line_length ~ interval)+
+  geom_mosaic(aes(x = product( significant, nwern_significant), fill=significant)) + scale_fill_manual(values = c("#721f81",  "#feca8d"))
+
+# isolate p < 0.2
+f_test_date2 <- f_test_date %>%
+  mutate(significant = case_when(p.value <0.2 ~ "p < 0.2",
+                                 p.value >=0.2 ~ "not significant")%>% as_factor(),
+         nwern_significant = case_when(nwern_p.value <0.2 ~ "p < 0.2",
+                                       nwern_p.value >=0.2 ~ "not significant")%>% as_factor())
+
+ggplot(data = f_test_date2) +
+   facet_grid(n_lines + line_length ~ interval)+
+  geom_mosaic(aes(x = product( significant, nwern_significant), fill=significant)) + scale_fill_manual(values = c("#721f81",  "#feca8d"))
+
+# alternate contingency table
+contable5 <- f_test_date1 %>%  add_count(ProjectKey, group) %>% group_by(ProjectKey, group, nwern_significant, significant) %>% 
+  summarise(n_class = n(), 
+            freq= n()/n, 
+            total_n = n) 
+
+write.csv(contable5, paste0("results/lpi_f_test_contingency_table", Sys.Date(), ".csv"))
+
+# try stacked bar chart instead of mosaic plot
+ggplot(f_test_date,
+       aes(x=nwern_significant, 
+           fill = significant)) +
+  facet_grid(n_lines + line_length ~ interval)+
+  geom_bar(position = "fill")+
+  scale_fill_manual(values = c("#721f81", "#9e2f7f", "#feca8d"))
+
+
+  
+
+
+```
+
+## How many LPI pin drops are needed to detect 5, 10, 15% change in cover?
+
+```{r}
+f_test_date_diff <- f_test_date %>% 
+  left_join(iteration_calcs %>% select(PrimaryKey, 
+                                       group,
+                                       PK_nwern_percent = nwern_percent, 
+                                       PK_percent = percent), 
+            by = c("PrimaryKey", "group")) %>%
+  left_join(iteration_calcs %>% select(PrimaryKey, 
+                                       group,
+                                       compare_nwern_percent = nwern_percent, 
+                                       compare_percent = percent), 
+            by = c("compare" = "PrimaryKey", "group")) %>% 
+  mutate(nwern_diff = abs(PK_nwern_percent - compare_nwern_percent), 
+         subsample_diff = abs(PK_percent - compare_percent), 
+         nwern_diff_category = case_when(abs(nwern_diff) <5 ~ "< 5",
+                                     abs(nwern_diff) <10 & abs(nwern_diff) >=5~"< 10",
+                                     abs(nwern_diff) >=10 & abs(nwern_diff)<15 ~"< 20",
+                                     abs(nwern_diff) >=15 & abs(nwern_diff)<20 ~"< 15",
+                                     abs(nwern_diff) <=100 & abs(nwern_diff)>=20 ~"< 100"),
+         subsample_diff_category = case_when(abs(subsample_diff) <5 ~ "< 5",
+                                     abs(subsample_diff) < 10 & abs(subsample_diff) >=5~"< 10",
+                                     abs(subsample_diff) >=10 & abs(subsample_diff)<15 ~"< 15",
+                                     abs(subsample_diff) >=15 & abs(subsample_diff)<20 ~"< 20",
+                                     abs(subsample_diff) <=100 & abs(subsample_diff)>=20 ~"< 100"),
+         nwern_diff_category = factor(nwern_diff_category, 
+                                  levels = c( "< 5","< 10", "< 15","< 20", "< 100")),
+         subsample_diff_category = factor(subsample_diff_category, 
+                                  levels = c("< 5","< 10", "< 15","< 20", "< 100"))
+  )
+  
+# plot
+ggplot(f_test_date_diff,
+       aes(x=nwern_diff_category, 
+           fill = subsample_diff_category)) +
+  facet_grid(n_lines + line_length ~ interval)+
+  geom_bar(position = "fill") 
+
+ggplot(f_test_date_diff,
+       aes(x=nwern_diff, 
+           y = subsample_diff, 
+           color = nwern_diff_category)) +
+  facet_grid(n_lines + line_length ~ interval)+
+  geom_point() +geom_abline()
+    
+
+
+```
+
+## Species accumulation curves
+
+```{r}
+species_calcs <- 
+  tidyr::expand_grid(line_length = c(25,50, 100),
+  interval = c(25,50, 100, 200),
+  n_lines = c(1,2,3), 
+  FUN = c(pct_cover_species))  %>% purrr::pmap_df(lpi_iteration, lpi_tall = lpi_tall)
+
+# reserve the actual NWERN implementation
+nwern_spp_calcs <- species_calcs %>% subset(line_length == 100 &
+                                          interval == 25 &
+                                          n_lines == 3) %>% 
+  select(PrimaryKey, Species, nwern_percent=percent, nwern_pin_n = pin_n)
+
+#join back to iterations
+species_calcs <- dplyr::left_join(nwern_spp_calcs, species_calcs) %>%
+  # get difference
+  dplyr::mutate(difference = nwern_percent-percent)
+
+# add group variable
+species_calcs <- species_calcs %>% dplyr::mutate(
+  group = paste("I", interval, "L", line_length, "N", n_lines, sep = "_")
+)
+
+species_calcs$group[species_calcs$group=="I_25_L_100_N_3"]<-"NWERN Base"
+
+# remove species where percent = 0
+species_calcs <- species_calcs |> subset(nwern_percent!=0)
+
+write.csv(species_calcs, paste0("results/lpi_spp_iteration", Sys.Date(), ".csv"))
+
+# number of species/plot
+n_spp <- species_calcs |> group_by(PrimaryKey, group)|> count()
+
+species_calcs <- species_calcs |> dplyr::left_join(n_spp)
+
+species_calcs <- species_calcs |>  subset(group == "NWERN Base") %>% 
+  select(PrimaryKey, nwern_n = n) %>% distinct() %>%
+  left_join(species_calcs, .) %>% 
+  mutate(spp_diff = nwern_n - n)
+
+# set up species_calcs for plotting
+species_calcs <- species_calcs %>%
+  dplyr::mutate(n_lines = as.factor(n_lines) %>% fct_rev(),
+                line_length = as.factor(line_length) %>% fct_rev(),
+                    interval = as.factor(interval))
+
+species_calcs_new<- species_calcs |> subset(interval!= 200)
+
+ggplot(species_calcs, 
+       aes(x = interval, 
+           y = spp_diff, 
+           group = interval)) +
+  facet_grid(n_lines~ line_length)+
+  geom_boxplot()
+  
+
+
+```
+
+### Species cover related to detection
+
+```{r}
+species_calcs <- species_calcs|>
+  mutate(species_detect = case_when(percent == 0 ~ "no",
+                                    percent >=  0~ "yes"))
+
+# were species with >20% cover always detected? Answer: yes
+species_20 <- species_calcs |> subset(nwern_percent >=20)
+any(species_20$percent==0)
+
+ggplot(species_calcs %>% subset(nwern_percent <20), 
+       aes(x = nwern_percent, 
+           y = percent,
+           color = species_detect)) +
+  facet_grid(n_lines~ line_length + interval)+
+  geom_point() + geom_abline()
+
+ggplot(species_calcs %>% subset(nwern_percent <20), 
+       aes(x = nwern_percent, 
+           fill = species_detect)) +
+  facet_grid(n_lines + line_length ~ interval)+
+  geom_bar() +
+  scale_x_binned(n.breaks = 4)
+
+ggplot(species_calcs %>% subset(nwern_percent <20), 
+       aes(x = nwern_percent, 
+           fill = species_detect)) +
+  facet_grid(n_lines + line_length ~ interval)+
+  geom_histogram(binwidth = 5) 
+
+```
+
+### Species detection as a function of diversity lost
+
+```{r}
+
+species_calcs <- species_calcs|>
+  mutate(prop_detect = n/nwern_n)
+
+ggplot(species_calcs, 
+       aes(x = interval, 
+           y = prop_detect, 
+           group = interval)) +
+  facet_grid(line_length ~ n_lines)+
+  geom_boxplot()
+
+```
+
+# Height
+
+```{r}
+
+# height <- readRDS("data/NWERN_tall_height_2022-09-08.rdata")
+# 
+# # count number of pin drops in plots
+# n_height_measured <- height %>% select(PrimaryKey, LineKey, PointNbr) %>% distinct() %>% 
+#   group_by(PrimaryKey) %>% count()
+# 
+# # calculate height
+# height_iteration <- 
+```
+
+# Canopy gap
+
+```{r}
+gap <- readRDS("data/NWERN_tall_gap_2022-09-08.rdata")
+
+# summarize n gap lines/plot visit
+gap_summary <- gap %>% 
+    dplyr::select(PrimaryKey, LineKey) %>% dplyr::distinct() %>%
+  group_by(PrimaryKey) %>% count()
+
+# remove plots with less than 3 lines of gap
+gap <- gap %>% subset(PrimaryKey %in% gap_summary$PrimaryKey[gap_summary$n==3])
+
+# remove gaps of NA
+## recalculate gaps to make sure Gap is always populated
+gap <- gap %>% 
+  mutate(Gap = abs(GapStart - GapEnd))
+gap_na <- gap %>% subset(is.na(gap$Gap))
+gap <- gap %>% subset(!is.na(gap$Gap))
+
+# for some plots, gaps are read from the outside in, we need to reverse that
+gap <- gap %>% 
+  mutate(GapStart_old = GapStart, 
+         GapEnd_old = GapEnd, 
+         GapStart = case_when(GapStart_old > GapEnd_old ~ GapEnd_old, 
+                              TRUE ~ GapStart_old), 
+         GapEnd = case_when(GapStart_old > GapEnd_old ~ GapStart_old, 
+                              TRUE ~ GapEnd_old)) %>%
+  select(-GapStart_old, -GapEnd_old)
+
+
+# gap calcs
+## generate raw data
+gap_iteration_raw_data <- 
+  tidyr::expand_grid(line_length = c(25,50, 100),
+  n_lines = c(1,2,3))  %>% purrr::pmap_df(gap_iteration, gap = gap)
+
+# calculate gaps by subset data
+gap_calcs <- lapply(X = unique(gap_iteration_raw_data$group), 
+                    FUN = function(X){
+                      gap_subset <- gap_iteration_raw_data %>% 
+                        subset(group %in% X)
+                      cover <- gap_cover(gap_subset, tall = TRUE)
+                      cover$group <- X
+                      cover <- left_join(cover, 
+                                         gap_subset %>% select(group,
+                                                               n_lines, 
+                                                               line_length) %>%
+                                           distinct())
+                    }) %>% do.call(rbind, .) 
+  
+
+
+# identify base NWERN
+# reserve the actual NWERN implementation
+nwern_gap_calcs <- gap_calcs %>% subset(line_length == 100 &
+                                          n_lines == 3) %>% 
+  select(PrimaryKey, 
+         gap_class, 
+         nwern_percent=percent, 
+         nwern_n = n,
+         nwern_length = length)
+
+#join back to iterations
+gap_calcs <- dplyr::left_join(nwern_gap_calcs, gap_calcs) %>%
+  # get difference
+  dplyr::mutate(percent_difference = nwern_percent-percent)
+
+gap_calcs$group[gap_calcs$group=="L_100_N_3"]<-"NWERN Base"
+
+write.csv(gap_calcs, paste0("results/gap_iteration", Sys.Date(), ".csv"))
+
+gap_iteration_raw_data$group[gap_iteration_raw_data$group=="L_100_N_3"]<-"NWERN Base"
+
+write.csv(gap_iteration_raw_data, paste0("results/gap_iteration_raw_data", Sys.Date(), ".csv"))
+
+
+```
+
+## How does canopy gap class vary by transect length?
+
+```{r}
+gap_calcs <- latest_file(fpattern="gap_iteration.*csv", 
+                               fpath="results") %>% read.csv()
+
+# format factors for plotting
+gap_calcs <- gap_calcs %>%
+  dplyr::mutate(n_lines = as.factor(n_lines) %>% fct_rev(),
+                line_length = as.factor(line_length) %>% fct_rev(), 
+                gap_class = factor(gap_class, 
+                                   levels = c( "20-25","25-51", "51-101", "101-201", "201-Inf", "NoGap")))
+
+# remove "NoGap" from the analysis
+gap_calcs <- gap_calcs %>% subset(gap_class != "NoGap") %>%
+  mutate(gap_class = droplevels(gap_class))
+
+
+ggplot(gap_calcs, 
+       aes(x = gap_class, 
+           y = percent_difference)) +
+  facet_grid(line_length ~n_lines) +
+  geom_boxplot()+
+  geom_hline(yintercept = -5, linetype="dashed", color = "red")+
+  geom_hline(yintercept = 5, linetype="dashed", color = "red")
+  
+```
+
+## How does this vary by Gap class and percent difference?
+
+```{r}
+gap_diff_summary <- gap_calcs %>% 
+  mutate(difference_type = case_when(abs(percent_difference) <2 ~ "< 2", 
+                                     abs(percent_difference) <5 & abs(percent_difference) >=2 ~ "< 5",
+                                     abs(percent_difference) <10 & abs(percent_difference) >=5~"< 10",
+                                     abs(percent_difference) >=10 ~"> 10"),
+         difference_type = factor(difference_type, 
+                                  levels = c("< 2", "< 5","< 10", "> 10"))
+  ) %>% 
+  group_by(group, gap_class) %>% add_count(name = "total_n_percent") %>% 
+  group_by(group, difference_type, gap_class) %>% summarise(freq = n()/unique(total_n_percent)) %>%
+  dplyr::left_join(gap_calcs %>% dplyr::select(group,
+                                               gap_class, 
+                                                     line_length, 
+                                                     n_lines) %>% distinct())
+
+ggplot(gap_diff_summary,
+       aes(x=gap_class, 
+           y = freq,
+           fill = difference_type)) +
+  facet_grid(line_length ~ n_lines)+
+  geom_bar(stat = "identity")
+
+# plot 
+```
+
+### Are the different iterations significantly different from base NWERN?
+
+```{r test significance}
+# first generate all the raw data for each subsample
+gap_calcs <- latest_file(fpattern="gap_iteration.*csv", 
+                               fpath="results") %>% read.csv()
+# f test will compare proportion of plot in each category for all sample sizes
+f_test_gap <- pmap_df(distinct(gap_calcs %>% select(PK_sample = PrimaryKey, 
+                                                    group_sample = group,
+                                                    gap_indicator = gap_class)) %>% 
+                   filter(group_sample!="NWERN Base") %>%
+                    mutate(compare_group = "NWERN Base", 
+                           compare_sample = ""),fisher_test_gap)
+
+write.csv(f_test, paste0("results/gap_f_test", Sys.Date(), ".csv"))
+
+ftest_summary_gap <- f_test_gap %>% 
+  dplyr::group_by(group, gap_class) %>% add_tally(name = "total_n") %>% 
+  dplyr::mutate(significant = dplyr::case_when(p.value <= 0.05 ~ "yes", 
+                                               p.value > 0.05 ~ "no"))
+
+
+ftest_summary_gap2 <- ftest_summary_gap %>%  group_by(group, gap_class, significant) %>% summarise(prop_significant = n()/total_n) %>% distinct()
+
+# add group, interval, n_line, line_length to table
+ftest_summary_gap2 <- dplyr::left_join(ftest_summary_gap2, 
+                                    gap_calcs %>% dplyr::select(group,
+                                                                      line_length, 
+                                                                      n_lines,
+                                                                      gap_class)%>% 
+                                     distinct())%>% 
+  dplyr::mutate(n_lines = as.factor(n_lines),
+                line_length = as.factor(line_length)
+                )
+
+# plot significance
+ggplot(ftest_summary2, 
+                        aes(x = gap_class, 
+                            y = prop_significant,
+                            fill = significant)) +
+     facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_bar(position="stack", stat="identity")
+
+
+
+```
+
+## Detect changes over time at each site
+
+```{r}
+{r}
+
+# add DateVisited
+gap_calcs <- gap_calcs %>% 
+  dplyr::left_join(indicators %>% dplyr::select(ProjectKey, 
+                                                PrimaryKey, 
+                                                DateVisited), 
+                   by = "PrimaryKey")
+
+# plot
+ggplot(iteration_calcs, aes(x = DateVisited, y = percent, color = group)) +
+  facet_wrap(. ~ ProjectKey) + 
+  geom_line() 
+
+# look at differences over time
+visit_combos <- gap_calcs %>% 
+  mutate (project_group = paste0(ProjectKey, group)) %>% 
+            group_by(ProjectKey) %>% do(data.frame(t(combn(.$PrimaryKey, 2)))) %>% 
+  distinct() %>% rename(PK_sample = X1, 
+                        compare_pk = X2) %>% 
+  subset(PK_sample != compare_pk) %>% 
+  
+# add sample group iteration in
+  tidyr::expand(PK_sample, compare_pk, group_sample = unique(gap_calcs$group), 
+                                                    gap_indicator = unique(gap_calcs$gap_class)) %>% ungroup()
+
+# calculate significant differences between all plot visit combinations within a subsample group
+plan(multisession, workers = 4)
+
+f_test_date_gap<- future_pmap(visit_combos %>% select(PK_sample, 
+                                          compare_sample = compare_pk, 
+                                          group_sample,
+                                          gap_indicator) %>%
+                            mutate(compare_group = ""),
+                          fisher_test_gap) 
+
+f_test_date_gap_df <- f_test_date_gap %>% do.call(bind_rows, .)
+
+# join back in combos that failed (either because no data are present in the class or base NWERN)
+f_test_date_gap_df <- left_join(visit_combos, f_test_date_gap_df, 
+                                c("PK_sample" = "PrimaryKey", 
+                                  "compare_pk" = "compare", 
+                                  "group_sample" = "group", 
+                                  "gap_indicator" = "gap_class")) %>% 
+  rename("PrimaryKey" = "PK_sample", 
+         "compare" = "compare_pk", 
+         "group" = "group_sample", 
+         "gap_class" = "gap_indicator")
+
+# extract the NWERN base visit tests
+nwern_f_test <- f_test_date_gap_df %>% subset(group == "NWERN Base") %>%
+  mutate(nwern_significant = case_when(p.value <0.05 ~ "p < 0.05",
+                                       p.value >=0.05 & p.value <0.2 ~ "0.2 > p >= 0.5",
+                                       p.value >=0.2 ~ "not significant"), 
+         nwern_p.value = p.value)
+
+f_test_date_gap_df <- dplyr::left_join(f_test_date_gap_df, nwern_f_test %>% 
+                                  select(PrimaryKey, 
+                                         compare,                                                                      nwern_significant, 
+                                         nwern_p.value, 
+                                         gap_class), 
+                                by = c("PrimaryKey",  "compare", "gap_class")) %>% 
+  mutate(significant = case_when(p.value <0.05 ~ "p < 0.05",
+                                 p.value >=0.05 & p.value <0.2 ~ "0.2 > p >= 0.5",
+                                 p.value >=0.2 ~ "not significant"))
+
+# set levels
+f_test_date_gap_df <- f_test_date_gap_df %>% 
+  dplyr::mutate(nwern_significant = nwern_significant %>% as_factor(), 
+                significant = significant %>% as_factor())
+
+f_test_date_gap_df <- dplyr::left_join(f_test_date_gap_df, 
+                                       gap_calcs %>% dplyr::select(group,
+                                                                   line_length, 
+                                                                   n_lines, 
+                                                                   gap_class) %>% 
+                                         distinct()) 
+
+# remove instances where significant is na
+f_test_date_gap_df <- f_test_date_gap_df %>% subset(!is.na(significant))
+
+write.csv(f_test_date_gap_df, paste0("results/gap_f_test_date", Sys.Date(), ".csv"))
+
+# # change levels
+# f_test_date_gap_df <- f_test_date %>% 
+#   dplyr::mutate(n_lines = as.factor(n_lines) %>% fct_rev(),
+#                 line_length = as.factor(line_length) %>% fct_rev(),
+#                 interval = as.factor(interval))
+
+# plot
+library(ggmosaic)
+
+
+ggplot(data = f_test_date_gap_df) +
+   facet_grid(n_lines ~ line_length)+
+  geom_mosaic(aes(x = product( significant, nwern_significant), fill=significant)) +
+
+  scale_fill_manual(values = c("#721f81", "#9e2f7f", "#feca8d"))
+
+# try stacked bar chart instead of mosaic plot
+ggplot(f_test_date_gap_df,
+       aes(x=nwern_significant, 
+           fill = significant)) +
+  facet_grid(gap_class ~ n_lines+line_length)+
+  geom_bar(position = "fill")+
+  scale_fill_manual(values = c("#721f81", "#9e2f7f", "#feca8d"))
+```
+
+## 
+How many lines/line length are needed to detect 5, 10, 15% change in cover?
+
+```{r}
+f_test_date_diff <- f_test_date_gap_df %>% 
+  left_join(gap_calcs %>% select(PrimaryKey, 
+                                       group,gap_class,
+                                       PK_nwern_percent = nwern_percent, 
+                                       PK_percent = percent), 
+            by = c("PrimaryKey", "group", "gap_class")) %>%
+  left_join(gap_calcs %>% select(PrimaryKey, 
+                                       group,gap_class,
+                                       compare_nwern_percent = nwern_percent, 
+                                       compare_percent = percent), 
+            by = c("compare" = "PrimaryKey", "group", "gap_class")) %>% 
+  mutate(nwern_diff = abs(PK_nwern_percent - compare_nwern_percent), 
+         subsample_diff = abs(PK_percent - compare_percent), 
+         nwern_diff_category = case_when(abs(nwern_diff) <5 ~ "< 5",
+                                     abs(nwern_diff) <10 & abs(nwern_diff) >=5~"< 10",
+                                     abs(nwern_diff) >=10 & abs(nwern_diff)<15 ~"< 20",
+                                     abs(nwern_diff) >=15 & abs(nwern_diff)<20 ~"< 15",
+                                     abs(nwern_diff) <=100 & abs(nwern_diff)>=20 ~"< 100"),
+         subsample_diff_category = case_when(abs(subsample_diff) <5 ~ "< 5",
+                                     abs(subsample_diff) < 10 & abs(subsample_diff) >=5~"< 10",
+                                     abs(subsample_diff) >=10 & abs(subsample_diff)<15 ~"< 15",
+                                     abs(subsample_diff) >=15 & abs(subsample_diff)<20 ~"< 20",
+                                     abs(subsample_diff) <=100 & abs(subsample_diff)>=20 ~"< 100"),
+         nwern_diff_category = factor(nwern_diff_category, 
+                                  levels = c( "< 5","< 10", "< 15","< 20", "< 100")),
+         subsample_diff_category = factor(subsample_diff_category, 
+                                  levels = c("< 5","< 10", "< 15","< 20", "< 100"))
+  )
+  
+# plot
+ggplot(f_test_date_diff,
+       aes(x=nwern_diff_category, 
+           fill = subsample_diff_category)) +
+  facet_grid(n_lines + line_length ~ gap_class)+
+  geom_bar(position = "fill") 
+
+ggplot(f_test_date_diff,
+       aes(x=nwern_diff, 
+           y = subsample_diff, 
+           color = nwern_diff_category)) +
+  facet_grid(n_lines + line_length ~ interval)+
+  geom_point() +geom_abline()
+```
+
+# Questions
+
+Look at within site comparison--over time and to full NWERN implementation.
+
+1.  
+
+2.  How many height measurements are needed to detect a 10% change in height?
+
+3.  What is the influence of transect length vs \# of pin drops?
+
+4.  What is the influence of transect length on gap intercept estimates?
+
+5.  Is there a difference in estimates for 3 dispersed transects vs one single transect?

@@ -87,7 +87,7 @@ visit_stats
 
 # summarize data by ProjectKey
 indicator_summary <- ind_tall %>%
-  dplyr::group_by(ProjectKey, PrimaryKey, indicator) %>% 
+  dplyr::group_by(ProjectKey, indicator) %>% 
   dplyr::summarise(mean = mean(percent), 
                    sd = sd(percent, na.rm = F),
                      max = max(percent),
@@ -122,7 +122,7 @@ args <- list(
   line_length = c(25,50, 100),
   interval = c(25,50, 100, 200),
   n_lines = c(1,2,3), 
-  FUN = c(pct_cover_bare_soil, pct_cover_total_foliar)
+  FUN = c(pct_cover_total_foliar)
 )
 
 iteration_calcs <- args %>%
@@ -132,7 +132,7 @@ iteration_calcs <- args %>%
 nwern_calcs <- iteration_calcs %>% subset(line_length == 100 &
                                           interval == 25 &
                                           n_lines == 3) %>% 
-  select(PrimaryKey, indicator, nwern_percent=percent)
+  select(PrimaryKey, indicator, nwern_percent=percent, nwern_pin_n = pin_n)
 
 #join back to iterations
 iteration_calcs <- dplyr::left_join(nwern_calcs, iteration_calcs) %>%
@@ -146,13 +146,13 @@ iteration_calcs <- iteration_calcs %>% dplyr::mutate(
 
 iteration_calcs$group[iteration_calcs$group=="I_25_L_100_N_3"]<-"NWERN Base"
 
-write.csv(iteration_calcs, paste0("results/lpi_teration", Sys.Date(), ".csv"))
+write.csv(iteration_calcs, paste0("results/lpi_iteration", Sys.Date(), ".csv"))
 ```
 
 Summarize and plot results
 
 ```{r summarize results}
-iteration_calcs <- latest_file(fpattern="lpi_teration.*csv", 
+iteration_calcs <- latest_file(fpattern="lpi_iteration.*csv", 
                                fpath="results") %>% read.csv()
 
 iteration_summary <- iteration_calcs %>% dplyr::group_by(indicator, interval, n_lines, line_length) %>% 
@@ -289,10 +289,11 @@ ggplot(iteration_calcs %>% subset(indicator == "TotalFoliarCover" & interval == 
 # a proportions test is more appropriate for LPI as it is a binary response variable and thus follows the binomial distribution
 ptest <- iteration_calcs %>% subset(nwern_percent > 0) %>%
   mutate(percent_n = round(percent*pin_n/100),
-         nwern_percent_n = round(nwern_percent*pin_n/100)) %>%
+         nwern_percent_n = round(nwern_percent*nwern_pin_n/100)) %>%
   group_by(PrimaryKey, group, indicator) %>%
   summarise(ptest_p = prop.test(x= c(percent_n, nwern_percent_n), 
-                                n = c(pin_n, pin_n))$p.value) %>% 
+                                n = c(pin_n, nwern_pin_n)
+                                )$p.value) %>% 
   mutate(significant = case_when(ptest_p<=0.05 ~ "yes",
                                  TRUE ~ "no"))
 
@@ -306,18 +307,24 @@ ptest_summary2 <- dplyr::left_join(ptest_summary2,
                                     iteration_calcs %>% dplyr::select(group,
                                                                       line_length, 
                                                                       n_lines, 
-                                                                      interval) %>% 
+                                                                      interval, 
+                                                                      pin_n) %>% 
                                      distinct())%>% 
   dplyr::mutate(n_lines = as.factor(n_lines) %>% fct_rev(),
                 line_length = as.factor(line_length) %>% fct_rev(),
-                    interval = as.factor(interval))
+                    interval = as.factor(interval)
+                )
 
 # plot significance
-prop_test_sig <- ggplot(ptest_summary2 %>% subset(prop_significant =="yes"), 
-                        aes(x = interval,
-                            y = prop_significant, 
-                            color = n_lines)) +
-   geom_bar()
+prop_test_sig <- ggplot(ptest_summary2 %>% subset(indicator == "TotalFoliarCover"), 
+                        aes(x = interval, 
+                            y = prop_significant,
+                            fill = significant)) +
+     facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_bar(position="stack", stat="identity")
+
+prop_test_sig
 
 # # do a ttest to see if different to full NWERN implementation, remove instances where the NWERN default sampling set up recorded 0??
 # lpi_ttest <- iteration_ttest(iteration_calcs)
