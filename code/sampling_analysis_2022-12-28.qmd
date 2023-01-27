@@ -869,6 +869,7 @@ ggplot(f_test_date_gap_df,
 ```
 
 ## 
+
 How many lines/line length are needed to detect 5, 10, 15% change in cover?
 
 ```{r}
