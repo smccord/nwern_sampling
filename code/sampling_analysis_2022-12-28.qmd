@@ -1,4 +1,5 @@
 ---
+dev---
 title: "NWERN Sampling Analysis"
 format: 
   html:
@@ -22,6 +23,13 @@ library(furrr)
 
 # load functions
 source("functions.R")
+source("ldc_functions.R")
+
+# load data from LDC
+header <- fetch_ldc(data_type = "header")
+nwern_keys <- header$ProjectKey[grepl("^NWERN", header$ProjectKey)] %>% unique()
+
+
 # read in data
 indicators <- readRDS("data/NWERN_geoIndicators_2022-09-09.rdata")
 
@@ -564,14 +572,97 @@ ggplot(species_calcs,
 
 ```{r}
 
-# height <- readRDS("data/NWERN_tall_height_2022-09-08.rdata")
-# 
-# # count number of pin drops in plots
-# n_height_measured <- height %>% select(PrimaryKey, LineKey, PointNbr) %>% distinct() %>% 
-#   group_by(PrimaryKey) %>% count()
-# 
-# # calculate height
-# height_iteration <- 
+height <- fetch_ldc(keys = nwern_keys, 
+                    key_type = "ProjectKey",
+                    data_type = "height")
+
+# count number of pin drops in plots
+n_height_measured <- height %>% select(PrimaryKey, LineKey, PointNbr) %>% distinct() %>%
+  group_by(PrimaryKey) %>% count()
+
+# subset to instances where height n > 1000
+height <- height %>% subset(PrimaryKey %in% n_height_measured$PrimaryKey[n_height_measured$n >1000])
+
+# remove NAs
+height_tall <- height %>% subset(!is.na(Species)&!is.na(Height)) 
+
+# calculate height
+height_iteration_calcs <- tidyr::expand_grid(line_length = c(25,50, 100),
+  interval = c(8,16,24,32,40),
+  n_lines = c(1,2,3), 
+  FUN = c(terradactyl::mean_height))  %>% purrr::pmap_df(height_iteration, height_tall = height_tall)
+
+# reserve the actual NWERN implementation
+nwern_calcs <- height_iteration_calcs %>% subset(line_length == 100 &
+                                          interval == 8 &
+                                          n_lines == 3) %>% 
+  select(PrimaryKey, indicator, nwern_height=mean_height, nwern_pin_n = pin_n)
+
+#join back to iterations
+height_iteration_calcs <- dplyr::left_join(nwern_calcs, height_iteration_calcs) %>%
+  # get difference
+  dplyr::mutate(difference = nwern_height-mean_height)
+
+# add group variable
+height_iteration_calcs <- height_iteration_calcs %>% dplyr::mutate(
+  group = paste("I", interval, "L", line_length, "N", n_lines, sep = "_")
+)
+
+height_iteration_calcs$group[height_iteration_calcs$group=="I_8_L_100_N_3"]<-"NWERN Base"
+
+write.csv(height_iteration_calcs, paste0("results/height_iteration", Sys.Date(), ".csv"))
+```
+
+## Summarize results
+
+```{r}
+#add factor levels to iteration scenarios
+height_iteration_calcs <- height_iteration_calcs %>% 
+  dplyr::mutate(n_lines = as.factor(n_lines) %>% fct_rev(),
+                line_length = as.factor(line_length) %>% fct_rev(),
+                    interval = as.factor(interval))
+
+# plot differences
+diff <- ggplot(height_iteration_calcs,
+                        aes(x = interval,
+                            y = difference, 
+                            group = interval)) +
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_boxplot()+
+  geom_hline(yintercept = -5, linetype="dashed", color = "red")+
+  geom_hline(yintercept = 5, linetype="dashed", color = "red")
+diff
+```
+
+### How often do this differences occur? 
+
+```{r}
+{r}
+diff_summary <- height_iteration_calcs %>% 
+  mutate(difference_type = case_when(abs(difference) <5~ "< 5",
+                                     abs(difference) >=5 ~"> 5")) %>% 
+  group_by(group) %>% add_count() %>% 
+  group_by(group, difference_type) %>% summarise(freq = n()/unique(n)) %>%
+  dplyr::left_join(height_iteration_calcs %>% dplyr::select(group,
+                                                     line_length, 
+                                                     n_lines, 
+                                                     interval, 
+                                                     pin_n) %>% distinct())
+
+ggplot(diff_summary,
+       aes(x=interval, 
+           y = freq,
+           fill = difference_type)) +
+  facet_grid(cols = vars(n_lines),
+             rows = vars(line_length))+
+  geom_bar(stat = "identity")
+```
+
+### Logistic regression
+
+```{r}
+logit_model <- 
 ```
 
 # Canopy gap

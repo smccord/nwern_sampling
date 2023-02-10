@@ -267,4 +267,92 @@ gap_iteration <- function(
   
 }
 
+# Height iteration ####
+# build lpi function that iterates over different line lengths, height drop intervals, and number of transects
+height_iteration <- function(height_tall, 
+                          line_length = 100,
+                          interval = 8, 
+                          n_lines = 1, 
+                          FUN){
+  
+  print(paste("line length:", line_length, "interval:", interval, "n_lines:", n_lines ))
+  # select PointNbrs to use
+  point_nbr <- seq(8,line_length*4, interval)
+  
+  # convert pin_n to PointNbr
+  pin_n = length(point_nbr)*n_lines
+  
+  # reset transect layout to radiating spoke design if transects <= 50 m
+  if(line_length <=50){
+    height_tall <- lapply(X = unique(height_tall$PrimaryKey), 
+                       FUN = function(x) {
+                         print(x)
+                         pk_data <- height_tall %>% subset(PrimaryKey %in% x)
+                         line_key_data <- lapply(X = unique(pk_data$LineKey), 
+                                                 FUN = function(x){
+                                                   line_data <- pk_data %>% subset(LineKey %in% x)
+                                                   line_missing_pt <- setdiff(seq(8,400,8), line_data$PointNbr) 
+                                                   # it appears occasionally the pad is not removed from data
+                                                   if(length(line_missing_pt)==0){
+                                                     line_missing_pt <- 201
+                                                   }
+                                                   # line a will run from the middle of the transect out instead of out in
+                                                   line_a <- line_data %>% 
+                                                     subset(PointNbr %in% 1:(min(line_missing_pt)-1)) %>% 
+                                                     dplyr::left_join(
+                                                       tibble(PointNbr = seq(8,(min(line_missing_pt)-1),8), 
+                                                              PointNbr_new = rev(seq(8,(min(line_missing_pt)-1),8)))) %>% 
+                                                     dplyr::mutate(
+                                                       PointNbr_old = PointNbr,
+                                                       PointNbr = PointNbr_new, 
+                                                       LineKey = paste0(LineKey, "a")) 
+                                                   # line b will run from out in but we reset numbers to run from 1 to n
+                                                   if(length(line_missing_pt)==0){
+                                                     line_missing_pt <- 200
+                                                   }
+                                                   
+                                                   # if for some reason point 400 is missing, drop this from line_missing_pt
+                                                   if(400 %in% line_missing_pt){
+                                                     line_missing_pt <- line_missing_pt[!line_missing_pt %in% 400]
+                                                   }
+                                                   
+                                                   line_b <- line_data %>% 
+                                                     subset(PointNbr %in% max(line_missing_pt):400) %>% 
+                                                     dplyr::left_join(tibble(PointNbr = seq((max(line_missing_pt)+8),400,8), 
+                                                                             PointNbr_new = seq(8,(400-max(line_missing_pt)),8))) %>%
+                                                     dplyr::mutate(
+                                                       PointNbr_old = PointNbr,
+                                                       PointNbr = PointNbr_new, 
+                                                       LineKey = paste0(LineKey, "b")) 
+                                                   
+                                                   new_line_data <- dplyr::bind_rows(line_a, line_b)
+                                                   
+                                                   
+                                                 } ) %>% do.call(bind_rows, .) 
+                         
+                         
+                       })  %>% do.call(bind_rows, .) 
+    
+    
+  }
+  
+  # subset needed pin drops
+  height_subset <- height_tall %>% subset(PointNbr %in% point_nbr)
+  
+  # randomly subset number of lines
+  lines_summary <- height_subset %>% dplyr::select(PrimaryKey, LineKey) %>%
+    dplyr::distinct() %>% dplyr::group_by(PrimaryKey) %>% dplyr::slice_sample(n = n_lines)
+  
+  height_subset <- dplyr::left_join(lines_summary, height_subset)
+  
+  height <- FUN(height_subset, omit_zero = TRUE, tall = TRUE) %>% dplyr::mutate(line_length = line_length, 
+                                                          interval = interval, 
+                                                          n_lines, 
+                                                          pin_n)
+  
+}
+
+
+
+
 
